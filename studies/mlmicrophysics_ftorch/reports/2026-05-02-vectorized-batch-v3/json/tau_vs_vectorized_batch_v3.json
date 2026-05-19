@@ -1,0 +1,272 @@
+{
+  "history_compare": {
+    "file_a": "/pscratch/sd/d/dvpatel/mlmicrophysics_project/e3sm_ftorch_scratch/e3sm2025_mlmicro_tau_cmp_v3/tests/XS_1x1_ndays/run/e3sm2025_mlmicro_tau_cmp_v3.eam.h1.2001-01-01-00000.nc",
+    "file_b": "/pscratch/sd/d/dvpatel/mlmicrophysics_project/e3sm_ftorch_scratch/e3sm2025_mlmicro_ftorch_batch_cmp_v3/tests/XS_1x1_ndays/run/e3sm2025_mlmicro_ftorch_batch_cmp_v3.eam.h1.2001-01-01-00000.nc",
+    "missing_requested": [
+      "P3_nctend_TAU",
+      "P3_nrtend_TAU",
+      "P3_qctend_TAU",
+      "P3_qrtend_TAU"
+    ],
+    "variables": {
+      "CLDLIQ": {
+        "allclose_0_0": false,
+        "max_abs": 0.0005301951837974328,
+        "max_rel": 4.137927026022226e+296,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 14199,
+        "rms": 5.03716926953044e-06,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      },
+      "CLOUD": {
+        "allclose_0_0": false,
+        "max_abs": 1.0,
+        "max_rel": 9.999999999999999e+299,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 31774,
+        "rms": 0.046794214220843344,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      },
+      "NUMLIQ": {
+        "allclose_0_0": false,
+        "max_abs": 244085060.0,
+        "max_rel": 2.335022089330288e+20,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 9735,
+        "rms": 3342893.4154405897,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      },
+      "NUMRAI": {
+        "allclose_0_0": false,
+        "max_abs": 33374635.525146484,
+        "max_rel": 5.026796895086089e+17,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 35118,
+        "rms": 85885.5821635762,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      },
+      "P3_nctend_TAU_raw": {
+        "allclose_0_0": false,
+        "max_abs": 4426030.25,
+        "max_rel": 2.7613599999999997e+305,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 11618,
+        "rms": 15066.402316593132,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      },
+      "P3_nrtend_TAU_raw": {
+        "allclose_0_0": false,
+        "max_abs": 3191678.25,
+        "max_rel": 1.0057693359374999e+304,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 51898,
+        "rms": 10770.44256496826,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      },
+      "P3_qctend_TAU_raw": {
+        "allclose_0_0": false,
+        "max_abs": 6.475495956692612e-05,
+        "max_rel": 1.1768788681365549e+295,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 9981,
+        "rms": 4.415408661396385e-07,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      },
+      "P3_qrtend_TAU_raw": {
+        "allclose_0_0": false,
+        "max_abs": 6.475495956692612e-05,
+        "max_rel": 1.1768788681365549e+295,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 10063,
+        "rms": 4.4154086614650217e-07,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      },
+      "PRECL": {
+        "allclose_0_0": false,
+        "max_abs": 9.229194120052853e-08,
+        "max_rel": 1.2412038627798715e+288,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 1892,
+        "rms": 6.088930544477192e-09,
+        "shape": [
+          5,
+          384
+        ],
+        "shape_match": true
+      },
+      "PRECT": {
+        "allclose_0_0": false,
+        "max_abs": 3.5270311647683794e-07,
+        "max_rel": 1.2412038627798715e+288,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 1892,
+        "rms": 2.0340752148030234e-08,
+        "shape": [
+          5,
+          384
+        ],
+        "shape_match": true
+      },
+      "RAINQM": {
+        "allclose_0_0": false,
+        "max_abs": 0.0002091873148515333,
+        "max_rel": 1.403257374477107e+295,
+        "nonfinite_mismatch_count": 0,
+        "nonzero_diff_count": 41490,
+        "rms": 1.5696204613971064e-06,
+        "shape": [
+          5,
+          80,
+          384
+        ],
+        "shape_match": true
+      }
+    }
+  },
+  "label_a": "tau_v3",
+  "label_b": "vectorized_batch_ftorch_v3",
+  "restart_compare": {
+    "file_a": "/pscratch/sd/d/dvpatel/mlmicrophysics_project/e3sm_ftorch_scratch/e3sm2025_mlmicro_tau_cmp_v3/tests/XS_1x1_ndays/run/e3sm2025_mlmicro_tau_cmp_v3.eam.r.2001-01-02-00000.nc",
+    "file_b": "/pscratch/sd/d/dvpatel/mlmicrophysics_project/e3sm_ftorch_scratch/e3sm2025_mlmicro_ftorch_batch_cmp_v3/tests/XS_1x1_ndays/run/e3sm2025_mlmicro_ftorch_batch_cmp_v3.eam.r.2001-01-02-00000.nc",
+    "missing_requested": [
+      "CLDLIQ",
+      "CLOUD",
+      "NUMLIQ",
+      "NUMRAI",
+      "P3_nctend_TAU",
+      "P3_nctend_TAU_raw",
+      "P3_nrtend_TAU",
+      "P3_nrtend_TAU_raw",
+      "P3_qctend_TAU",
+      "P3_qctend_TAU_raw",
+      "P3_qrtend_TAU",
+      "P3_qrtend_TAU_raw",
+      "PRECL",
+      "PRECT",
+      "RAINQM"
+    ],
+    "variables": {}
+  },
+  "timing": {
+    "tau_v3": {
+      "archive": "/pscratch/sd/d/dvpatel/mlmicrophysics_project/e3sm_ftorch_scratch/e3sm2025_mlmicro_tau_cmp_v3/tests/XS_1x1_ndays/run/timing.52352616.260502-001018.tar.gz",
+      "timers": {
+        "a:bc_physics": {
+          "count": 2400.0,
+          "wallmax": 5.983,
+          "walltotal": 494.8105
+        },
+        "a:micro_p3_tend_loop": {
+          "count": 14400.0,
+          "wallmax": 4.537,
+          "walltotal": 359.3665
+        },
+        "a:microp_p3_tend": {
+          "count": 14400.0,
+          "wallmax": 4.556,
+          "walltotal": 361.0196
+        },
+        "a:microp_tend": {
+          "count": 14400.0,
+          "wallmax": 4.568,
+          "walltotal": 362.0967
+        },
+        "a:physpkg_st1": {
+          "count": 2400.0,
+          "wallmax": 0.063,
+          "walltotal": 4.212107
+        },
+        "a_i:micro_p3_tend_loop": {
+          "count": 576.0,
+          "wallmax": 0.182,
+          "walltotal": 14.41895
+        },
+        "a_i:microp_p3_tend": {
+          "count": 576.0,
+          "wallmax": 0.183,
+          "walltotal": 14.49749
+        }
+      }
+    },
+    "vectorized_batch_ftorch_v3": {
+      "archive": "/pscratch/sd/d/dvpatel/mlmicrophysics_project/e3sm_ftorch_scratch/e3sm2025_mlmicro_ftorch_batch_cmp_v3/tests/XS_1x1_ndays/run/timing.52352596.260502-000808.tar.gz",
+      "timers": {
+        "a:bc_physics": {
+          "count": 2400.0,
+          "wallmax": 3.503,
+          "walltotal": 307.6683
+        },
+        "a:micro_p3_tend_loop": {
+          "count": 14400.0,
+          "wallmax": 1.92,
+          "walltotal": 163.5274
+        },
+        "a:microp_p3_tend": {
+          "count": 14400.0,
+          "wallmax": 1.94,
+          "walltotal": 165.6173
+        },
+        "a:microp_tend": {
+          "count": 14400.0,
+          "wallmax": 1.953,
+          "walltotal": 166.8474
+        },
+        "a:physpkg_st1": {
+          "count": 2400.0,
+          "wallmax": 0.064,
+          "walltotal": 4.192689
+        },
+        "a_i:micro_p3_tend_loop": {
+          "count": 576.0,
+          "wallmax": 0.26,
+          "walltotal": 21.94755
+        },
+        "a_i:microp_p3_tend": {
+          "count": 576.0,
+          "wallmax": 0.261,
+          "walltotal": 22.04486
+        }
+      }
+    }
+  }
+}

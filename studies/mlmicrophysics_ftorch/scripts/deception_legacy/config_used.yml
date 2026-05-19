@@ -1,0 +1,136 @@
+experiment:
+    name: "moe_nrtend_phase1a"
+    version: "v1.0"
+    description: "MoE 3-expert nrtend head (Phase 1A): freeze backbone+qrtend+nctend, train router+experts with lambda=0.75"
+    framework: "pytorch"
+
+data:
+  loader_type: "optimized"
+  data_path: "/rcfs/projects/pioneercloud/dhruv/processed_data"
+  out_path: "/people/pate014/nersc_mlmicro/outputs/moe_nrtend"
+  scaler_cache_dir: "/people/pate014/nersc_mlmicro/scaler_cache/deception_distributed_test"
+  input_cols:
+    - "QC_TAU_in"
+    - "QR_TAU_in"
+    - "NC_TAU_in"
+    - "NR_TAU_in"
+    - "PGAM"
+    - "LAMC"
+    - "LAMR"
+    - "N0R"
+    - "RHO_CLUBB"
+    - "CLOUD"
+    - "FREQR"
+  output_cols:
+    - "qctend_TAU"
+    - "nctend_TAU"
+    - "nrtend_TAU"
+    - "qrtend_TAU"
+  chunk_size: 1000000
+  max_files: 762 
+  subsample: 1.0
+  train_fraction: 0.8
+  batch_size: 8421376
+  num_workers: 0
+  scaler_fit_samples: 10000000
+  active_threshold: 1.0e-15
+  cloud_threshold: 0.01
+  mass_input_threshold: 1.0e-6
+  random_seed: 42
+  input_transform: log10
+  input_scaling: standard
+  output_transform: log10
+  output_scaling: standard
+  quantile_n_quantiles: 200000
+  quantile_subsample: 20000000
+
+  # arcsinh transform for nrtend (same as run_572567)
+  nrtend_arcsinh_transform: true
+  nrtend_arcsinh_threshold: 1.0e-3
+
+  # Reuse run_107666 scalers (arcsinh-aware, fitted during run_572567)
+  force_refit_scalers: false
+
+  # MoE regime label threshold (applied to raw nrtend_TAU before transforms)
+  nrtend_regime_threshold: 1.0e-6
+
+model:
+  architecture: "moe"
+  input_dim: 11
+  shared_dims: [256, 256, 256, 128, 128]
+  head_dims: [128, 128, 64, 64, 32]
+  dropout: 0.0
+  activation: "relu"          # backbone + standard heads (must match pretrained)
+  huber_delta: 1.0
+  use_masking: true
+
+  moe:
+    n_experts: 3
+    expert_hidden_dims: [128, 128, 64, 64, 32]    # each expert: 128->128->64->64->32->1
+    router_hidden_dims: [64, 64, 32]          # router:  128->64->64->32->3
+    activation: "silu"                    # router + experts
+    pretrained_checkpoint: "/people/pate014/nersc_mlmicro/outputs/deception_distributed_test/run_572567/latest_checkpoint.pth"
+    freeze_pretrained: true               # Phase 1: freeze backbone + qrtend/nctend
+    # ── Loss weights ──
+    # Phase 1A: lambda=0.75 (strong regime supervision early on)
+    # Phase 1B: reduce to ~0.25 to let regression dominate
+    gate_loss_weight: 0.9                # lambda
+    entropy_weight: 0.01                  # beta
+
+training:
+  epochs: 50                              
+  learning_rate: 0.001
+  weight_decay: 0.0
+  gradient_accumulation_steps: 1
+  use_amp: false
+  optimizer: "adam"
+  scheduler: "reduce_lr_on_plateau"
+  scheduler_params:
+    mode: "min"
+    factor: 0.5
+    patience: 5
+    min_lr: 1.0e-7
+  gradient_clip_norm: 1.0
+  early_stopping_patience: 100            # effectively disabled for Phase 1
+  device: "auto"
+  validation_frequency: 1
+  checkpoint_frequency: 1
+
+logging:
+  log_level: "INFO"
+  save_checkpoints: true
+  log_frequency: 50
+  epoch_log_frequency: 1
+  image_log_percent: 10
+  wandb:
+    project: mlmicrophysics_emulator
+    entity: dvpatel
+    group: moe_nrtend
+    job_type: training
+    max_val_batches: 24
+    tags: ["deception", "moe_nrtend", "arcsinh", "phase1a"]
+
+# ───────────────────────────────────────────────────────────────────
+# Phase switching cheat-sheet:
+#
+# Phase 1A (this config):
+#   moe.freeze_pretrained: true
+#   moe.gate_loss_weight:  0.75
+#   epochs: 10
+#   tags: phase1a
+#
+# Phase 1B:
+#   moe.freeze_pretrained: true
+#   moe.gate_loss_weight:  0.25    <-- reduce lambda
+#   epochs: 10-20
+#   tags: phase1b
+#   NOTE: submit with --resume pointing to Phase 1A checkpoint
+#
+# Phase 2:
+#   moe.freeze_pretrained: false   <-- unfreeze everything
+#   moe.gate_loss_weight:  0.1     <-- further reduce
+#   learning_rate: 1.0e-4          <-- very small LR
+#   epochs: 20-50
+#   tags: phase2
+#   NOTE: submit with --resume pointing to Phase 1B checkpoint
+# ───────────────────────────────────────────────────────────────────

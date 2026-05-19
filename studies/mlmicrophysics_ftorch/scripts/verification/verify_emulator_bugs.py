@@ -378,7 +378,7 @@ def test_1(training_df):
           f"{'MeanDiff':>10s} | {'DataLogStd':>11s} {'ScalerScale':>12s} {'StdDiff':>10s}")
     print("  " + "-" * 100)
 
-    for j, col in enumerate(scaler_cols):ƒ
+    for j, col in enumerate(scaler_cols):
         vals = training_df[col].values.astype(np.float64)
         lv = np.sign(vals) * np.log10(np.abs(vals) + LOG_EPSILON)
         dm, ds_ = np.mean(lv), np.std(lv)

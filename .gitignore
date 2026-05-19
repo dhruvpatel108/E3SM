@@ -55,3 +55,21 @@ components/eamxx/docs/_presentations_html/
 components/eamxx/src/python/build
 components/eamxx/src/python/build_src
 components/eamxx/src/python/dist
+
+# Figures
+*.png
+
+# CSV files
+*.csv
+
+# emulator performance evaluation files
+studies/mlmicrophysics_ftorch/reports/emulator_performance_evaluation/*
+studies/mlmicrophysics_ftorch/reports/legacy-root-logs/
+
+# AI Agent files
+.codex
+
+.cursor/*
+
+# Deception scripts
+deception_scripts/*

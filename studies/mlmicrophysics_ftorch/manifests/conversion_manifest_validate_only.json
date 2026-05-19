@@ -1,0 +1,60 @@
+{
+  "config_path": "/global/homes/d/dvpatel/e3sm_ftorch/studies/mlmicrophysics_ftorch/scripts/data_conversion/configs/e3sm2026_mlmicro_tau_train_smoke.yml",
+  "file_extension": "nc",
+  "file_glob_start": "e3sm2026_mlmicro_tau_train.eam.h1.2001-01-01-00000",
+  "file_summaries": [
+    {
+      "filename": "e3sm2026_mlmicro_tau_train.eam.h1.2001-01-01-00000.nc",
+      "hour_end": 1457,
+      "hour_start": 0,
+      "n_time": 32,
+      "time_end": 60.708333333333336,
+      "time_start": 0.0
+    }
+  ],
+  "generated_at_utc": "2026-04-13T19:31:39.695305+00:00",
+  "max_output_hour": 1457,
+  "min_output_hour": 0,
+  "mode": "validate_only",
+  "n_output_time_steps": 32,
+  "n_source_files": 1,
+  "n_unique_output_hours": 32,
+  "out_format": "parquet",
+  "out_path": "/tmp/processed_data_e3sm2026_smoke/",
+  "out_start": "e3sm_mp_data_smoke",
+  "out_variables": [
+    "T",
+    "RHO_CLUBB",
+    "CLOUD",
+    "FREQR",
+    "P3_qc_in_TAU",
+    "P3_nc_in_TAU",
+    "P3_qr_in_TAU",
+    "P3_nr_in_TAU",
+    "P3_qc_out_TAU",
+    "P3_nc_out_TAU",
+    "P3_qr_out_TAU",
+    "P3_nr_out_TAU",
+    "P3_qctend_TAU_raw",
+    "P3_nctend_TAU_raw",
+    "P3_qrtend_TAU_raw",
+    "P3_nrtend_TAU_raw",
+    "P3_mu_c",
+    "P3_lamc",
+    "P3_lamr",
+    "P3_nr"
+  ],
+  "output_hour_step_values": [
+    47
+  ],
+  "source_files": [
+    "/global/cfs/cdirs/m4942/e3sm/e3sm2026_mlmicro_tau_train/e3sm2026_mlmicro_tau_train.eam.h1.2001-01-01-00000.nc"
+  ],
+  "source_root": "/global/cfs/cdirs/m4942/e3sm/e3sm2026_mlmicro_tau_train/",
+  "subset_threshold": [
+    1e-08
+  ],
+  "subset_variable": [
+    "P3_qc_in_TAU"
+  ]
+}

@@ -88,7 +88,12 @@ module micro_p3
   use ftorch, only : torch_model, torch_tensor, torch_kCPU, torch_delete, &
                       torch_tensor_from_array, torch_model_load, torch_model_forward
 
-  use ftorch_inference, only : ftorch_inference_cpu, init_ftorch_inference
+  use ftorch_inference, only : ftorch_inference_cpu, ftorch_inference_cpu_batch, &
+                                ftorch_inference_cpu_dp, ftorch_inference_cpu_batch_dp, &
+                                init_ftorch_inference
+
+  ! GPTL timers — used to break out warm-rain step cost from total ATM cost.
+  use perf_mod, only : t_startf, t_stopf
 
   implicit none
   save
@@ -368,7 +373,7 @@ end function bfb_expm1
     implicit none
     
     character*(*), intent(in)     :: lookup_file_dir       !directory of the lookup tables
-    character*(*), intent(in)     :: warm_rain_method      ! 'tau','emulated', 'kk2000','ftorch_emulator'
+    character*(*), intent(in)     :: warm_rain_method      ! 'tau','emulated', 'kk2000','ftorch_emulator','ftorch_emulator_scalar','ftorch_emulator_dp','ftorch_emulator_scalar_dp'
     character*(*), intent(in) :: stochastic_emulated_filename_quantile, &
                stochastic_emulated_filename_input_scale, &
                stochastic_emulated_filename_output_scale ! Files for emulated machine learning
@@ -507,7 +512,11 @@ end function bfb_expm1
                                     stochastic_emulated_filename_output_scale, iulog, errstring)
     endif
 
-    if (trim(warm_rain_method) == 'ftorch_emulator') then
+    if (trim(warm_rain_method) == 'ftorch_emulator'        .or. &
+        trim(warm_rain_method) == 'ftorch_emulator_scalar' .or. &
+        trim(warm_rain_method) == 'ftorch_emulator_dp'     .or. &
+        trim(warm_rain_method) == 'ftorch_emulator_scalar_dp' .or. &
+        trim(warm_rain_method) == 'ftorch_emulator_chunk_dp') then
       call init_ftorch_inference(ftorch_emulator_file, model)
    endif
 
@@ -641,7 +650,8 @@ end function bfb_expm1
        qm, bm, latent_heat_vapor, latent_heat_sublim, latent_heat_fusion, qc_incld, qr_incld, qi_incld, qm_incld, nc_incld, nr_incld, &
        ni_incld, bm_incld, mu_c, nu, lamc, cdist, cdist1, cdistr, mu_r, lamr, logn0r, qv2qi_depos_tend, precip_total_tend, &
        nevapr, qr_evap_tend, vap_liq_exchange, vap_ice_exchange, liq_ice_exchange, pratot, &
-       prctot, frzimm, frzcnt, frzdep, p3_tend_out, p3_sc_tau_out, is_hydromet_present, do_precip_off, nccnst, warm_rain_method)
+       prctot, frzimm, frzcnt, frzdep, p3_tend_out, p3_sc_tau_out, is_hydromet_present, do_precip_off, nccnst, warm_rain_method, &
+       ftorch_out_chunk_col)
 
     implicit none
 
@@ -670,6 +680,9 @@ end function bfb_expm1
     logical(btype), intent(out) :: is_hydromet_present
 
     character(len=*),  intent(in)  ::  warm_rain_method
+
+    ! Pre-computed chunk-level outputs for ftorch_emulator_chunk_dp; absent for all other methods.
+    real(rtype), intent(in), optional, dimension(4, kts:kte) :: ftorch_out_chunk_col
 
     ! -------- locals ------- !
 
@@ -746,17 +759,200 @@ end function bfb_expm1
     real(rtype) :: ncheti_cnt,qcheti_cnt,nicnt,qicnt,ninuc_cnt,qinuc_cnt,qi_wetDepos     
 
     integer :: dumi,k,dumj,dumii,dumjj,dumzz
+    integer :: nlev_col, kk
 
     logical(btype) :: log_exitlevel, log_wetgrowth
+    logical(btype), dimension(kts:kte) :: skip_all_level, skip_micro_level
+    integer, dimension(kts:kte) :: row_for_k
 
    ! FTorch emulator buffers: 11 inputs, 4 outputs
    real(rtype), dimension(11), target :: ftorch_in
+   real(rtype), dimension(kts:kte) :: n0r_col
+   real(rtype), dimension(kts:kte) :: ftorch_nr_in_col
    real(sp),    dimension(4),  target :: ftorch_out_sp
    real(rtype), dimension(4),  target :: ftorch_out
+   ! Single-precision (float32) batch buffers for legacy ftorch_emulator path
+   real(sp),    dimension(11,abs(ktop-kbot)+1), target :: ftorch_in_batch
+   real(sp),    dimension(4,abs(ktop-kbot)+1),  target :: ftorch_out_batch
+   ! Double-precision (float64) batch buffers for ftorch_emulator_dp path
+   real(rtype), dimension(11,abs(ktop-kbot)+1), target :: ftorch_in_batch_dp
+   real(rtype), dimension(4,abs(ktop-kbot)+1),  target :: ftorch_out_batch_dp
+   ! Double-precision (float64) scalar buffers for ftorch_emulator_scalar_dp path
+   real(rtype), dimension(4),  target :: ftorch_out_dp
    ! Debug flag for emulator testing
-   logical(btype), parameter :: test_emulator = .true.
+   logical(btype), parameter :: test_emulator = .false.
    ! Ensure we only emit the debug block once per run
    logical(btype), save :: test_emulator_logged = .false.
+
+   nlev_col = abs(ktop-kbot) + 1
+   row_for_k = 0
+   skip_all_level = .false.
+   skip_micro_level = .false.
+   n0r_col = 0._rtype
+   ftorch_nr_in_col = 0._rtype
+   ftorch_in_batch = 0.0_sp
+   ftorch_out_batch = 0.0_sp
+   ftorch_in_batch_dp = 0.0_rtype
+   ftorch_out_batch_dp = 0.0_rtype
+
+   ! Vectorized-batch FTorch paths (float32 = 'ftorch_emulator', float64 = 'ftorch_emulator_dp').
+   ! Both pre-compute mu_c/lamc/n0r and pack the 11 input features for all in-column levels
+   ! before issuing a single inference call. The two paths differ only in the buffer dtype
+   ! and which inference subroutine they dispatch to.
+   ! ftorch_emulator_chunk_dp does NOT enter this block -- DSD arrays (mu_c, lamc, lamr,
+   ! ...) and the chunk-level inference were already populated by p3_warm_rain_emulator_chunk_dp
+   ! in p3_main, so we'd just be repeating work.  It gets a minimal-precomp branch below.
+   if (trim(warm_rain_method) == 'ftorch_emulator' .or. &
+       trim(warm_rain_method) == 'ftorch_emulator_dp') then
+      mu_c = 0._rtype
+      nu = 0._rtype
+      lamc = 0._rtype
+      cdist = 0._rtype
+      cdist1 = 0._rtype
+      mu_r = 0._rtype
+      lamr = 0._rtype
+      cdistr = 0._rtype
+      logn0r = 0._rtype
+
+      kk = 0
+      do k = kbot,ktop,kdir
+         kk = kk + 1
+         row_for_k(k) = kk
+
+         skip_all_level(k) = .true.
+         if (qc(k).ge.qsmall .or. qr(k).ge.qsmall) skip_all_level(k) = .false.
+         if (qi(k).ge.qsmall) skip_all_level(k) = .false.
+         if (skip_all_level(k) .and. (t_atm(k).lt.T_zerodegc .and. qv_supersat_i(k).lt.-0.05_rtype)) cycle
+         skip_all_level(k) = .false.
+
+         skip_micro_level(k) = .true.
+         if (qc_incld(k).ge.qsmall .or. qr_incld(k).ge.qsmall) skip_micro_level(k) = .false.
+         if (qi_incld(k).ge.qsmall) skip_micro_level(k) = .false.
+
+         if (.not. skip_micro_level(k)) then
+            call get_cloud_dsd2(qc_incld(k),nc_incld(k),mu_c(k),rho(k),nu(k),dnu,lamc(k), &
+                 cdist(k),cdist1(k))
+
+            call get_rain_dsd2(qr_incld(k),p3_max_mean_rain_size,nr_incld(k),mu_r(k),lamr(k), &
+                 cdistr(k),logn0r(k))
+            n0r_col(k) = 10.0_rtype**logn0r(k)
+         endif
+         ftorch_nr_in_col(k) = nr_incld(k)
+         if (qi_incld(k).ge.qsmall) ftorch_nr_in_col(k) = max(ftorch_nr_in_col(k),nsmall)
+
+         if (trim(warm_rain_method) == 'ftorch_emulator') then
+            ftorch_in_batch(1,kk)  = real(qc_incld(k),         kind=sp)
+            ftorch_in_batch(2,kk)  = real(qr_incld(k),         kind=sp)
+            ftorch_in_batch(3,kk)  = real(nc_incld(k),         kind=sp)
+            ftorch_in_batch(4,kk)  = real(ftorch_nr_in_col(k), kind=sp)
+            ftorch_in_batch(5,kk)  = real(mu_c(k),             kind=sp)
+            ftorch_in_batch(6,kk)  = real(lamc(k),             kind=sp)
+            ftorch_in_batch(7,kk)  = real(lamr(k),             kind=sp)
+            ftorch_in_batch(8,kk)  = real(n0r_col(k),          kind=sp)
+            ftorch_in_batch(9,kk)  = real(rho(k),              kind=sp)
+            ftorch_in_batch(10,kk) = real(cld_frac_l(k),       kind=sp)
+            ftorch_in_batch(11,kk) = real(cld_frac_r(k),       kind=sp)
+         else
+            ! ftorch_emulator_dp: keep all features in native rtype (float64), no down-cast.
+            ftorch_in_batch_dp(1,kk)  = qc_incld(k)
+            ftorch_in_batch_dp(2,kk)  = qr_incld(k)
+            ftorch_in_batch_dp(3,kk)  = nc_incld(k)
+            ftorch_in_batch_dp(4,kk)  = ftorch_nr_in_col(k)
+            ftorch_in_batch_dp(5,kk)  = mu_c(k)
+            ftorch_in_batch_dp(6,kk)  = lamc(k)
+            ftorch_in_batch_dp(7,kk)  = lamr(k)
+            ftorch_in_batch_dp(8,kk)  = n0r_col(k)
+            ftorch_in_batch_dp(9,kk)  = rho(k)
+            ftorch_in_batch_dp(10,kk) = cld_frac_l(k)
+            ftorch_in_batch_dp(11,kk) = cld_frac_r(k)
+         endif
+      enddo
+
+      if (test_emulator .and. .not. test_emulator_logged .and. row_for_k(kbot) > 0) then
+         kk = row_for_k(kbot)
+         write(iulog, *) '========================================='
+         write(iulog, *) '=== EMULATOR DEBUG TEST (micro_p3) ==='
+         write(iulog, *) '========================================='
+         write(iulog, *) 'warm_rain_method = ', trim(warm_rain_method)
+         write(iulog, *) 'Level:', kbot, ' (kbot=', kbot, ')'
+         if (trim(warm_rain_method) == 'ftorch_emulator') then
+            write(iulog, *) 'Batched emulator inputs (float32):'
+            write(iulog, *) '  QC_TAU_in  =', ftorch_in_batch(1,kk)
+            write(iulog, *) '  QR_TAU_in  =', ftorch_in_batch(2,kk)
+            write(iulog, *) '  NC_TAU_in  =', ftorch_in_batch(3,kk)
+            write(iulog, *) '  NR_TAU_in  =', ftorch_in_batch(4,kk)
+            write(iulog, *) '  PGAM       =', ftorch_in_batch(5,kk)
+            write(iulog, *) '  LAMC       =', ftorch_in_batch(6,kk)
+            write(iulog, *) '  LAMR       =', ftorch_in_batch(7,kk)
+            write(iulog, *) '  N0R        =', ftorch_in_batch(8,kk)
+            write(iulog, *) '  RHO_CLUBB  =', ftorch_in_batch(9,kk)
+            write(iulog, *) '  CLOUD      =', ftorch_in_batch(10,kk)
+            write(iulog, *) '  FREQR      =', ftorch_in_batch(11,kk)
+         else
+            write(iulog, *) 'Batched emulator inputs (float64):'
+            write(iulog, *) '  QC_TAU_in  =', ftorch_in_batch_dp(1,kk)
+            write(iulog, *) '  QR_TAU_in  =', ftorch_in_batch_dp(2,kk)
+            write(iulog, *) '  NC_TAU_in  =', ftorch_in_batch_dp(3,kk)
+            write(iulog, *) '  NR_TAU_in  =', ftorch_in_batch_dp(4,kk)
+            write(iulog, *) '  PGAM       =', ftorch_in_batch_dp(5,kk)
+            write(iulog, *) '  LAMC       =', ftorch_in_batch_dp(6,kk)
+            write(iulog, *) '  LAMR       =', ftorch_in_batch_dp(7,kk)
+            write(iulog, *) '  N0R        =', ftorch_in_batch_dp(8,kk)
+            write(iulog, *) '  RHO_CLUBB  =', ftorch_in_batch_dp(9,kk)
+            write(iulog, *) '  CLOUD      =', ftorch_in_batch_dp(10,kk)
+            write(iulog, *) '  FREQR      =', ftorch_in_batch_dp(11,kk)
+         endif
+      endif
+
+      if (trim(warm_rain_method) == 'ftorch_emulator') then
+         call ftorch_inference_cpu_batch(model, &
+              ftorch_in_batch(:,1:nlev_col), ftorch_out_batch(:,1:nlev_col))
+      elseif (trim(warm_rain_method) == 'ftorch_emulator_dp') then
+         call ftorch_inference_cpu_batch_dp(model, &
+              ftorch_in_batch_dp(:,1:nlev_col), ftorch_out_batch_dp(:,1:nlev_col))
+      ! ftorch_emulator_chunk_dp: per-column inference skipped; outputs in ftorch_out_chunk_col
+      endif
+
+      if (test_emulator .and. .not. test_emulator_logged .and. row_for_k(kbot) > 0) then
+         kk = row_for_k(kbot)
+         write(iulog, *) '-----------------------------------------'
+         if (trim(warm_rain_method) == 'ftorch_emulator') then
+            write(iulog, *) 'Batched emulator outputs (raw, float32):'
+            write(iulog, *) '  qrtend_TAU_raw =', ftorch_out_batch(1,kk)
+            write(iulog, *) '  nctend_TAU_raw =', ftorch_out_batch(2,kk)
+            write(iulog, *) '  nrtend_TAU_raw =', ftorch_out_batch(3,kk)
+            write(iulog, *) '  qctend_TAU_raw =', ftorch_out_batch(4,kk)
+         else
+            write(iulog, *) 'Batched emulator outputs (raw, float64):'
+            write(iulog, *) '  qrtend_TAU_raw =', ftorch_out_batch_dp(1,kk)
+            write(iulog, *) '  nctend_TAU_raw =', ftorch_out_batch_dp(2,kk)
+            write(iulog, *) '  nrtend_TAU_raw =', ftorch_out_batch_dp(3,kk)
+            write(iulog, *) '  qctend_TAU_raw =', ftorch_out_batch_dp(4,kk)
+         endif
+         write(iulog, *) '========================================='
+         write(iulog, *) '=== END EMULATOR DEBUG TEST ==='
+         write(iulog, *) '========================================='
+         test_emulator_logged = .true.
+      endif
+   endif
+
+   ! Minimal precomp for chunk_dp: DSD arrays (mu_c, lamc, lamr, ...) were already
+   ! filled by p3_warm_rain_emulator_chunk_dp in p3_main -- here we only need to
+   ! populate the per-level n0r_col and row_for_k bookkeeping that the k-loop
+   ! reads downstream.  This avoids the redundant get_cloud_dsd2/get_rain_dsd2
+   ! calls that the full block above would do.
+   if (trim(warm_rain_method) == 'ftorch_emulator_chunk_dp') then
+      kk = 0
+      do k = kbot, ktop, kdir
+         kk = kk + 1
+         row_for_k(k) = kk
+         if (qc_incld(k) >= qsmall .or. qr_incld(k) >= qsmall .or. qi_incld(k) >= qsmall) then
+            n0r_col(k) = 10.0_rtype**logn0r(k)
+         else
+            n0r_col(k) = 0._rtype
+         endif
+      enddo
+   endif
 
    rho_qm_cloud = 400._rtype
    is_hydromet_present = .false.
@@ -819,15 +1015,23 @@ end function bfb_expm1
            t_atm(k),pres(k),rho(k),latent_heat_vapor(k),latent_heat_sublim(k),qv_sat_l(k),qv_sat_i(k), &
            mu,dv,sc,dqsdt,dqsidt,ab,abi,kap,eii)
 
-      call get_cloud_dsd2(qc_incld(k),nc_incld(k),mu_c(k),rho(k),nu(k),dnu,lamc(k),     &
-           cdist(k),cdist1(k))
-      nc(k) = nc_incld(k)*cld_frac_l(k)
+      if (trim(warm_rain_method) == 'ftorch_emulator' .or. &
+          trim(warm_rain_method) == 'ftorch_emulator_dp' .or. &
+          trim(warm_rain_method) == 'ftorch_emulator_chunk_dp') then
+         nc(k) = nc_incld(k)*cld_frac_l(k)
+         nr(k) = nr_incld(k)*cld_frac_r(k)
+         n0r = n0r_col(k)
+      else
+         call get_cloud_dsd2(qc_incld(k),nc_incld(k),mu_c(k),rho(k),nu(k),dnu,lamc(k),     &
+              cdist(k),cdist1(k))
+         nc(k) = nc_incld(k)*cld_frac_l(k)
 
-      call get_rain_dsd2(qr_incld(k),p3_max_mean_rain_size,nr_incld(k),mu_r(k),lamr(k),   &
-           cdistr(k),logn0r(k))
-      nr(k) = nr_incld(k)*cld_frac_r(k)
+         call get_rain_dsd2(qr_incld(k),p3_max_mean_rain_size,nr_incld(k),mu_r(k),lamr(k),   &
+              cdistr(k),logn0r(k))
+         nr(k) = nr_incld(k)*cld_frac_r(k)
 
-      n0r=10.0**logn0r(k)  ! used by stochastic collection code, and for diagnostics
+         n0r=10.0**logn0r(k)  ! used by stochastic collection code, and for diagnostics
+      endif
 
       ! initialize inverse supersaturation relaxation timescale for combined ice categories
       epsi_tot = 0._rtype
@@ -1009,7 +1213,12 @@ end function bfb_expm1
 
  !     endif
 
-      if (warm_rain_method=='tau') then  
+      ! Wrap the entire warm-rain dispatch (TAU / emulated / ftorch_emulator*) so we can
+      ! report its cost separately from total ATM time.  For ftorch_emulator_chunk_dp the
+      ! per-level cost is just an array read; the heavy lifting is in p3_warm_rain_chunk_prep.
+      call t_startf('p3_warm_rain_dispatch')
+
+      if (warm_rain_method=='tau') then
 
          call p3_stochastic_collect_tau_tend(dt,t_atm(k),rho(k),qc_incld(k),     &
               nc_incld(k),qr_incld(k),nr_incld(k), &
@@ -1057,89 +1266,8 @@ end function bfb_expm1
 
       elseif (trim(warm_rain_method) == 'ftorch_emulator') then
       ! FTorch ML emulator for warm rain microphysics (standalone: physical in/out)
-
-         ! Map E3SM variables to emulator inputs (11 features, physical values)
-         ftorch_in(1)  = qc_incld(k)      ! QC_TAU_in
-         ftorch_in(2)  = qr_incld(k)      ! QR_TAU_in
-         ftorch_in(3)  = nc_incld(k)      ! NC_TAU_in
-         ftorch_in(4)  = nr_incld(k)      ! NR_TAU_in
-         ftorch_in(5)  = mu_c(k)          ! PGAM
-         ftorch_in(6)  = lamc(k)          ! LAMC
-         ftorch_in(7)  = lamr(k)          ! LAMR
-         ftorch_in(8)  = n0r              ! N0R (10**logn0r computed above)
-         ftorch_in(9)  = rho(k)           ! RHO_CLUBB
-         ftorch_in(10) = cld_frac_l(k)    ! CLOUD
-         ftorch_in(11) = cld_frac_r(k)    ! FREQR
-
-         ! DEBUG: Test emulator with known inputs from test set
-         ! Only run once per column at the bottom level (kbot)
-         if (test_emulator .and. k == kbot .and. .not. test_emulator_logged) then
-            write(iulog, *) '========================================='
-            write(iulog, *) '=== EMULATOR DEBUG TEST (micro_p3) ==='
-            write(iulog, *) '========================================='
-            write(iulog, *) 'Level:', k, ' (kbot=', kbot, ')'
-            write(iulog, *) 'Original E3SM inputs:'
-            write(iulog, *) '  QC_TAU_in  =', ftorch_in(1)
-            write(iulog, *) '  QR_TAU_in  =', ftorch_in(2)
-            write(iulog, *) '  NC_TAU_in  =', ftorch_in(3)
-            write(iulog, *) '  NR_TAU_in  =', ftorch_in(4)
-            write(iulog, *) '  PGAM       =', ftorch_in(5)
-            write(iulog, *) '  LAMC       =', ftorch_in(6)
-            write(iulog, *) '  LAMR       =', ftorch_in(7)
-            write(iulog, *) '  N0R        =', ftorch_in(8)
-            write(iulog, *) '  RHO_CLUBB  =', ftorch_in(9)
-            write(iulog, *) '  CLOUD      =', ftorch_in(10)
-            write(iulog, *) '  FREQR      =', ftorch_in(11)
-            
-            ! write(iulog, *) '-----------------------------------------'
-            ! write(iulog, *) 'Overriding with test sample values...'
-            
-            ! ! Override with known test sample
-            ! ftorch_in(1)  = 0.00029336384168_rtype       ! QC_TAU_in
-            ! ftorch_in(2)  = 1.9902995356E-10_rtype       ! QR_TAU_in
-            ! ftorch_in(3)  = 70800471.11_rtype            ! NC_TAU_in
-            ! ftorch_in(4)  = 0.058837683909_rtype         ! NR_TAU_in
-            ! ftorch_in(5)  = 9.363465298_rtype            ! PGAM
-            ! ftorch_in(6)  = 568758.77351_rtype           ! LAMC
-            ! ftorch_in(7)  = 8518.5056809_rtype           ! LAMR
-            ! ftorch_in(8)  = 501.20939251_rtype           ! N0R
-            ! ftorch_in(9)  = 0.001072655398_rtype         ! RHO_CLUBB
-            ! ftorch_in(10) = 1.0000000043_rtype           ! CLOUD
-            ! ftorch_in(11) = 0.000000026590097846_rtype   ! FREQR
-            
-            ! write(iulog, *) 'Test inputs:'
-            ! write(iulog, *) '  QC_TAU_in  =', ftorch_in(1)
-            ! write(iulog, *) '  QR_TAU_in  =', ftorch_in(2)
-            ! write(iulog, *) '  NC_TAU_in  =', ftorch_in(3)
-            ! write(iulog, *) '  NR_TAU_in  =', ftorch_in(4)
-            ! write(iulog, *) '  PGAM       =', ftorch_in(5)
-            ! write(iulog, *) '  LAMC       =', ftorch_in(6)
-            ! write(iulog, *) '  LAMR       =', ftorch_in(7)
-            ! write(iulog, *) '  N0R        =', ftorch_in(8)
-            ! write(iulog, *) '  RHO_CLUBB  =', ftorch_in(9)
-            ! write(iulog, *) '  CLOUD      =', ftorch_in(10)
-            ! write(iulog, *) '  FREQR      =', ftorch_in(11)
-         endif
-
-         ! Run emulator inference (single precision)
-         call ftorch_inference_cpu(model, real(ftorch_in, kind=sp), ftorch_out_sp)
-
-         ! Convert output back to model precision (4 tendencies)
+         ftorch_out_sp(:) = ftorch_out_batch(:,row_for_k(k))
          ftorch_out = real(ftorch_out_sp, kind=rtype)
-
-         ! DEBUG: Print outputs from test
-         if (test_emulator .and. k == kbot .and. .not. test_emulator_logged) then
-            write(iulog, *) '-----------------------------------------'
-            write(iulog, *) 'Emulator outputs (raw):'
-            write(iulog, *) '  qrtend_TAU_raw (ftorch_out(1)) =', ftorch_out(1)
-            write(iulog, *) '  nctend_TAU_raw (ftorch_out(2)) =', ftorch_out(2)
-            write(iulog, *) '  nrtend_TAU_raw (ftorch_out(3)) =', ftorch_out(3)
-            write(iulog, *) '  qctend_TAU_raw (ftorch_out(4)) =', ftorch_out(4)
-            write(iulog, *) '========================================='
-            write(iulog, *) '=== END EMULATOR DEBUG TEST ==='
-            write(iulog, *) '========================================='
-            test_emulator_logged = .true.
-         endif
 
          ! Assign raw tendencies from emulator
          qrtend_TAU_raw = ftorch_out(1)   ! Rain tendency
@@ -1158,7 +1286,114 @@ end function bfb_expm1
          qr_in_TAU = qr_incld(k)
          nr_in_TAU = nr_incld(k)
 
+      elseif (trim(warm_rain_method) == 'ftorch_emulator_scalar') then
+      ! Scalar FTorch path retained only for accuracy/performance comparisons.
+         ftorch_in(1)  = qc_incld(k)
+         ftorch_in(2)  = qr_incld(k)
+         ftorch_in(3)  = nc_incld(k)
+         ftorch_in(4)  = nr_incld(k)
+         ftorch_in(5)  = mu_c(k)
+         ftorch_in(6)  = lamc(k)
+         ftorch_in(7)  = lamr(k)
+         ftorch_in(8)  = n0r
+         ftorch_in(9)  = rho(k)
+         ftorch_in(10) = cld_frac_l(k)
+         ftorch_in(11) = cld_frac_r(k)
+
+         call ftorch_inference_cpu(model, real(ftorch_in, kind=sp), ftorch_out_sp)
+         ftorch_out = real(ftorch_out_sp, kind=rtype)
+
+         qrtend_TAU_raw = ftorch_out(1)
+         nctend_TAU_raw = ftorch_out(2)
+         nrtend_TAU_raw = ftorch_out(3)
+         qctend_TAU_raw = ftorch_out(4)
+
+         qctend_TAU = -1._rtype * qctend_TAU_raw
+         nctend_TAU = -1._rtype * nctend_TAU_raw
+         nrtend_TAU = nrtend_TAU_raw
+
+         qc_in_TAU = qc_incld(k)
+         nc_in_TAU = nc_incld(k)
+         qr_in_TAU = qr_incld(k)
+         nr_in_TAU = nr_incld(k)
+
+      elseif (trim(warm_rain_method) == 'ftorch_emulator_dp') then
+      ! Float64 vectorized-batch FTorch emulator. Reads pre-computed outputs from
+      ! the per-column inference call issued earlier. All in-cloud
+      ! features and tendencies stay in rtype (float64) — no down-cast to sp,
+      ! eliminating the float32 GEMM-vs-GEMV reduction-order disagreement that
+      ! caused the float32 batch path to diverge from the scalar path in E3SM.
+         ftorch_out(:) = ftorch_out_batch_dp(:,row_for_k(k))
+
+         qrtend_TAU_raw = ftorch_out(1)
+         nctend_TAU_raw = ftorch_out(2)
+         nrtend_TAU_raw = ftorch_out(3)
+         qctend_TAU_raw = ftorch_out(4)
+
+         qctend_TAU = -1._rtype * qctend_TAU_raw
+         nctend_TAU = -1._rtype * nctend_TAU_raw
+         nrtend_TAU = nrtend_TAU_raw
+
+         qc_in_TAU = qc_incld(k)
+         nc_in_TAU = nc_incld(k)
+         qr_in_TAU = qr_incld(k)
+         nr_in_TAU = nr_incld(k)
+
+      elseif (trim(warm_rain_method) == 'ftorch_emulator_scalar_dp') then
+      ! Float64 scalar FTorch path. Requires a TorchScript model exported with
+      ! float64 weights so the dtypes line up; passing a float32 model here
+      ! will trip a libtorch type assertion at the forward call.
+         ftorch_in(1)  = qc_incld(k)
+         ftorch_in(2)  = qr_incld(k)
+         ftorch_in(3)  = nc_incld(k)
+         ftorch_in(4)  = nr_incld(k)
+         ftorch_in(5)  = mu_c(k)
+         ftorch_in(6)  = lamc(k)
+         ftorch_in(7)  = lamr(k)
+         ftorch_in(8)  = n0r
+         ftorch_in(9)  = rho(k)
+         ftorch_in(10) = cld_frac_l(k)
+         ftorch_in(11) = cld_frac_r(k)
+
+         call ftorch_inference_cpu_dp(model, ftorch_in, ftorch_out_dp)
+         ftorch_out = ftorch_out_dp
+
+         qrtend_TAU_raw = ftorch_out(1)
+         nctend_TAU_raw = ftorch_out(2)
+         nrtend_TAU_raw = ftorch_out(3)
+         qctend_TAU_raw = ftorch_out(4)
+
+         qctend_TAU = -1._rtype * qctend_TAU_raw
+         nctend_TAU = -1._rtype * nctend_TAU_raw
+         nrtend_TAU = nrtend_TAU_raw
+
+         qc_in_TAU = qc_incld(k)
+         nc_in_TAU = nc_incld(k)
+         qr_in_TAU = qr_incld(k)
+         nr_in_TAU = nr_incld(k)
+
+      elseif (trim(warm_rain_method) == 'ftorch_emulator_chunk_dp') then
+      ! Chunk-level float64 batch path. Outputs were pre-computed in p3_main via a single
+      ! FTorch call over all pcols*pver samples. Unpack the pre-computed column slice here.
+         ftorch_out(:) = ftorch_out_chunk_col(:, row_for_k(k))
+
+         qrtend_TAU_raw = ftorch_out(1)
+         nctend_TAU_raw = ftorch_out(2)
+         nrtend_TAU_raw = ftorch_out(3)
+         qctend_TAU_raw = ftorch_out(4)
+
+         qctend_TAU = -1._rtype * qctend_TAU_raw
+         nctend_TAU = -1._rtype * nctend_TAU_raw
+         nrtend_TAU = nrtend_TAU_raw
+
+         qc_in_TAU = qc_incld(k)
+         nc_in_TAU = nc_incld(k)
+         qr_in_TAU = qr_incld(k)
+         nr_in_TAU = nr_incld(k)
+
       endif
+
+      call t_stopf('p3_warm_rain_dispatch')
 
 
       !.....................................
@@ -1565,6 +1800,102 @@ end function bfb_expm1
 
   !==========================================================================================!
 
+  SUBROUTINE p3_warm_rain_emulator_chunk_dp(its, ite, kts, kte, kbot, ktop, kdir, &
+       qc_incld, nc_incld, qr_incld, nr_incld, qi_incld, rho, cld_frac_l, cld_frac_r, &
+       mu_c, nu, lamc, cdist, cdist1, mu_r, lamr, cdistr, logn0r, &
+       is_nucleat_possible_col, is_hydromet_present_col, &
+       p3_max_mean_rain_size, ftorch_in_chunk_dp, ftorch_out_chunk_dp)
+
+    ! Packs 11 features for every (column, level) cell in the chunk into a flat 2D buffer
+    ! and issues a single FTorch inference call over all ncol*nlev samples, avoiding the
+    ! per-column dispatch overhead of the ftorch_emulator_dp path.  Called from p3_main
+    ! after part1 has run for all columns.
+    !
+    ! DSD output arrays (mu_c, lamc, lamr, ...) are written here so p3_main_part2 can
+    ! skip its batch-precomputation block for chunk_dp -- avoids redundant
+    ! get_cloud_dsd2 / get_rain_dsd2 calls per cell.
+
+    implicit none
+
+    integer,      intent(in)  :: its, ite, kts, kte, kbot, ktop, kdir
+    real(rtype),  intent(in),     dimension(its:ite, kts:kte) :: qc_incld, qr_incld, qi_incld, &
+                                                                  rho, cld_frac_l, cld_frac_r
+    real(rtype),  intent(inout),  dimension(its:ite, kts:kte) :: nc_incld, nr_incld, &
+                                                                  mu_c, nu, lamc, cdist, cdist1, &
+                                                                  mu_r, lamr, cdistr, logn0r
+    logical(btype), intent(in), dimension(its:ite) :: is_nucleat_possible_col, is_hydromet_present_col
+    real(rtype),  intent(in)  :: p3_max_mean_rain_size
+    real(rtype),  intent(out), dimension(11,(ite-its+1)*(kte-kts+1)), target :: ftorch_in_chunk_dp
+    real(rtype),  intent(out), dimension(4, (ite-its+1)*(kte-kts+1)), target :: ftorch_out_chunk_dp
+
+    integer      :: i, k, kk, col_offset, nlev
+    logical(btype) :: skip_micro
+    real(rtype)  :: n0r_val, ftorch_nr_tmp
+
+    nlev = kte - kts + 1
+
+    ftorch_in_chunk_dp  = 0._rtype
+    ftorch_out_chunk_dp = 0._rtype
+
+    ! Zero the DSD output arrays so cells we skip stay at zero (matches what
+    ! p3_main_part2's batch-precomputation block used to do).
+    mu_c   = 0._rtype
+    nu     = 0._rtype
+    lamc   = 0._rtype
+    cdist  = 0._rtype
+    cdist1 = 0._rtype
+    mu_r   = 0._rtype
+    lamr   = 0._rtype
+    cdistr = 0._rtype
+    logn0r = 0._rtype
+
+    do i = its, ite
+       if (.not. (is_nucleat_possible_col(i) .or. is_hydromet_present_col(i))) cycle
+       col_offset = (i - its) * nlev
+       kk = 0
+       do k = kbot, ktop, kdir
+          kk = kk + 1
+
+          skip_micro = (qc_incld(i,k) < qsmall) .and. &
+                       (qr_incld(i,k) < qsmall) .and. &
+                       (qi_incld(i,k) < qsmall)
+
+          n0r_val = 0._rtype
+
+          if (.not. skip_micro) then
+             ! get_cloud_dsd2 may clip nc to nsmall; get_rain_dsd2 may clip nr.
+             ! We let those clips persist (intent(inout)) -- same behavior as
+             ! part2's batch-precomp used to give.
+             call get_cloud_dsd2(qc_incld(i,k), nc_incld(i,k), mu_c(i,k), rho(i,k), nu(i,k), dnu, &
+                  lamc(i,k), cdist(i,k), cdist1(i,k))
+             call get_rain_dsd2(qr_incld(i,k), p3_max_mean_rain_size, nr_incld(i,k), mu_r(i,k), &
+                  lamr(i,k), cdistr(i,k), logn0r(i,k))
+             n0r_val = 10.0_rtype**logn0r(i,k)
+          endif
+
+          ftorch_nr_tmp = nr_incld(i,k)
+          if (qi_incld(i,k) >= qsmall) ftorch_nr_tmp = max(ftorch_nr_tmp, nsmall)
+
+          ftorch_in_chunk_dp(1,  col_offset + kk) = qc_incld(i,k)
+          ftorch_in_chunk_dp(2,  col_offset + kk) = qr_incld(i,k)
+          ftorch_in_chunk_dp(3,  col_offset + kk) = nc_incld(i,k)
+          ftorch_in_chunk_dp(4,  col_offset + kk) = ftorch_nr_tmp
+          ftorch_in_chunk_dp(5,  col_offset + kk) = mu_c(i,k)
+          ftorch_in_chunk_dp(6,  col_offset + kk) = lamc(i,k)
+          ftorch_in_chunk_dp(7,  col_offset + kk) = lamr(i,k)
+          ftorch_in_chunk_dp(8,  col_offset + kk) = n0r_val
+          ftorch_in_chunk_dp(9,  col_offset + kk) = rho(i,k)
+          ftorch_in_chunk_dp(10, col_offset + kk) = cld_frac_l(i,k)
+          ftorch_in_chunk_dp(11, col_offset + kk) = cld_frac_r(i,k)
+       enddo
+    enddo
+
+    call ftorch_inference_cpu_batch_dp(model, ftorch_in_chunk_dp, ftorch_out_chunk_dp)
+
+  END SUBROUTINE p3_warm_rain_emulator_chunk_dp
+
+  !==========================================================================================!
+
   SUBROUTINE p3_main(qc,nc,qr,nr,th_atm,qv,dt,qi,qm,ni,bm,                                                                                                               &
        pres,dz,nc_nuceat_tend,nccn_prescribed,ni_activated,frzimm,frzcnt,frzdep,inv_qc_relvar,it,precip_liq_surf,precip_ice_surf,its,ite,kts,kte,diag_eff_radius_qc,     &
        diag_eff_radius_qi,rho_qi,do_predict_nc, do_prescribed_CCN,p3_autocon_coeff,p3_accret_coeff,p3_qc_autocon_expon,p3_nc_autocon_expon,p3_qc_accret_expon,           &
@@ -1678,7 +2009,7 @@ end function bfb_expm1
     real(rtype), intent(in),    dimension(its:ite,kts:kte)      :: inv_qc_relvar
     real(rtype), intent(out),   dimension(its:ite,kts:kte)      :: diag_equiv_reflectivity,diag_ze_rain,diag_ze_ice  ! equivalent reflectivity [dBZ]
 
-    character(len=*), intent(in)  :: warm_rain_method  ! 'tau','emulated', 'kk2000','ftorch_emulator'
+    character(len=*), intent(in)  :: warm_rain_method  ! 'tau','emulated', 'kk2000','ftorch_emulator','ftorch_emulator_scalar','ftorch_emulator_dp','ftorch_emulator_scalar_dp'
 
 #ifdef SCREAM_CONFIG_IS_CMAKE
     real(rtype), optional, intent(out) :: elapsed_s ! duration of main loop in seconds
@@ -1724,8 +2055,14 @@ end function bfb_expm1
 
     logical(btype) :: is_nucleat_possible, is_hydromet_present
 
+    ! chunk-dp: per-column flags saved from the pre-pass, and flat chunk inference buffers.
+    logical(btype), dimension(its:ite) :: is_nucleat_possible_col, is_hydromet_present_col
+    real(rtype), dimension(11,(ite-its+1)*(kte-kts+1)), target :: ftorch_in_chunk_dp
+    real(rtype), dimension(4, (ite-its+1)*(kte-kts+1)), target :: ftorch_out_chunk_dp
+    integer :: chunk_col_start, chunk_col_end
+
     !--These will be added as namelist parameters in the future
-    logical(btype), parameter :: debug_ON     = .true.  !.true. to switch on debugging checks/traps throughout code  TODO: Turn this back off as default once the tlay error is found.
+    logical(btype), parameter :: debug_ON     = .false.  !.true. to switch on debugging checks/traps throughout code
     logical(btype), parameter :: debug_ABORT  = .false.  !.true. will result in forced abort in s/r 'check_values'
 
     real(rtype),dimension(its:ite,kts:kte) :: qc_old, nc_old, qr_old, nr_old, qi_old, ni_old, qv_old, th_atm_old
@@ -1817,6 +2154,33 @@ end function bfb_expm1
     call system_clock(clock_count1, clock_count_rate, clock_count_max)
 #endif
 
+    ! chunk-dp pre-pass: run part1 for every column first, then issue one chunk-level
+    ! FTorch inference over all ncol*nlev samples.  For all other warm_rain_method values
+    ! this block is a no-op and part1 is called inside i_loop_main as before.
+    if (trim(warm_rain_method) == 'ftorch_emulator_chunk_dp') then
+       is_nucleat_possible_col = .false.
+       is_hydromet_present_col = .false.
+       ftorch_in_chunk_dp  = 0._rtype
+       ftorch_out_chunk_dp = 0._rtype
+       do i = its, ite
+          call p3_main_part1(kts, kte, kbot, ktop, kdir, do_predict_nc, do_prescribed_CCN, dt, &
+               pres(i,:), dpres(i,:), dz(i,:), nc_nuceat_tend(i,:), nccn_prescribed(i,:), exner(i,:), inv_exner(i,:), &
+               inv_cld_frac_l(i,:), inv_cld_frac_i(i,:), inv_cld_frac_r(i,:), latent_heat_vapor(i,:), latent_heat_sublim(i,:), latent_heat_fusion(i,:), &
+               t_atm(i,:), rho(i,:), inv_rho(i,:), qv_sat_l(i,:), qv_sat_i(i,:), qv_supersat_i(i,:), rhofacr(i,:), &
+               rhofaci(i,:), acn(i,:), qv(i,:), th_atm(i,:), qc(i,:), nc(i,:), qr(i,:), nr(i,:), &
+               qi(i,:), ni(i,:), qm(i,:), bm(i,:), qc_incld(i,:), qr_incld(i,:), &
+               qi_incld(i,:), qm_incld(i,:), nc_incld(i,:), nr_incld(i,:), &
+               ni_incld(i,:), bm_incld(i,:), is_nucleat_possible_col(i), is_hydromet_present_col(i), nccnst)
+       enddo
+       call t_startf('p3_warm_rain_chunk_prep')
+       call p3_warm_rain_emulator_chunk_dp(its, ite, kts, kte, kbot, ktop, kdir, &
+            qc_incld, nc_incld, qr_incld, nr_incld, qi_incld, rho, cld_frac_l, cld_frac_r, &
+            mu_c, nu, lamc, cdist, cdist1, mu_r, lamr, cdistr, logn0r, &
+            is_nucleat_possible_col, is_hydromet_present_col, &
+            p3_max_mean_rain_size, ftorch_in_chunk_dp, ftorch_out_chunk_dp)
+       call t_stopf('p3_warm_rain_chunk_prep')
+    endif
+
     !==
     !-----------------------------------------------------------------------------------!
     i_loop_main: do i = its,ite  ! main i-loop (around the entire scheme)
@@ -1831,14 +2195,20 @@ end function bfb_expm1
       endif
 
 
-       call p3_main_part1(kts, kte, kbot, ktop, kdir, do_predict_nc, do_prescribed_CCN, dt, &
-            pres(i,:), dpres(i,:), dz(i,:), nc_nuceat_tend(i,:), nccn_prescribed(i,:), exner(i,:), inv_exner(i,:), &
-            inv_cld_frac_l(i,:), inv_cld_frac_i(i,:), inv_cld_frac_r(i,:), latent_heat_vapor(i,:), latent_heat_sublim(i,:), latent_heat_fusion(i,:), &
-            t_atm(i,:), rho(i,:), inv_rho(i,:), qv_sat_l(i,:), qv_sat_i(i,:), qv_supersat_i(i,:), rhofacr(i,:), &
-            rhofaci(i,:), acn(i,:), qv(i,:), th_atm(i,:), qc(i,:), nc(i,:), qr(i,:), nr(i,:), &
-            qi(i,:), ni(i,:), qm(i,:), bm(i,:), qc_incld(i,:), qr_incld(i,:), &
-            qi_incld(i,:), qm_incld(i,:), nc_incld(i,:), nr_incld(i,:), &
-            ni_incld(i,:), bm_incld(i,:), is_nucleat_possible, is_hydromet_present, nccnst)
+       if (trim(warm_rain_method) == 'ftorch_emulator_chunk_dp') then
+          ! Part1 already ran in the pre-pass; restore per-column flags.
+          is_nucleat_possible = is_nucleat_possible_col(i)
+          is_hydromet_present = is_hydromet_present_col(i)
+       else
+          call p3_main_part1(kts, kte, kbot, ktop, kdir, do_predict_nc, do_prescribed_CCN, dt, &
+               pres(i,:), dpres(i,:), dz(i,:), nc_nuceat_tend(i,:), nccn_prescribed(i,:), exner(i,:), inv_exner(i,:), &
+               inv_cld_frac_l(i,:), inv_cld_frac_i(i,:), inv_cld_frac_r(i,:), latent_heat_vapor(i,:), latent_heat_sublim(i,:), latent_heat_fusion(i,:), &
+               t_atm(i,:), rho(i,:), inv_rho(i,:), qv_sat_l(i,:), qv_sat_i(i,:), qv_supersat_i(i,:), rhofacr(i,:), &
+               rhofaci(i,:), acn(i,:), qv(i,:), th_atm(i,:), qc(i,:), nc(i,:), qr(i,:), nr(i,:), &
+               qi(i,:), ni(i,:), qm(i,:), bm(i,:), qc_incld(i,:), qr_incld(i,:), &
+               qi_incld(i,:), qm_incld(i,:), nc_incld(i,:), nr_incld(i,:), &
+               ni_incld(i,:), bm_incld(i,:), is_nucleat_possible, is_hydromet_present, nccnst)
+       endif
 
       if (debug_ON) then
          tmparr1(i,:) = th_atm(i,:)*inv_exner(i,:)!(pres(i,:)*1.e-5)**(rd*inv_cp)
@@ -1848,22 +2218,44 @@ end function bfb_expm1
        !jump to end of i-loop if is_nucleat_possible=.false.  (i.e. skip everything)
        if (.not. (is_nucleat_possible .or. is_hydromet_present)) goto 333
 
-       call p3_main_part2(kts, kte, kbot, ktop, kdir, do_predict_nc, do_prescribed_CCN, dt, inv_dt, &
-            p3_autocon_coeff,p3_accret_coeff,p3_qc_autocon_expon,p3_nc_autocon_expon,p3_qc_accret_expon, &
-            p3_wbf_coeff,p3_embryonic_rain_size, p3_max_mean_rain_size, &
-            pres(i,:), dpres(i,:), dz(i,:), nc_nuceat_tend(i,:), exner(i,:), inv_exner(i,:), &
-            inv_cld_frac_l(i,:), inv_cld_frac_i(i,:), inv_cld_frac_r(i,:), ni_activated(i,:), inv_qc_relvar(i,:), &
-            cld_frac_i(i,:), cld_frac_l(i,:), cld_frac_r(i,:), qv_prev(i,:), t_prev(i,:), &
-            t_atm(i,:), rho(i,:), inv_rho(i,:), qv_sat_l(i,:), &
-            qv_sat_i(i,:), qv_supersat_i(i,:), rhofacr(i,:), rhofaci(i,:), acn(i,:), qv(i,:), th_atm(i,:), &
-            qc(i,:), nc(i,:), qr(i,:), nr(i,:), qi(i,:), ni(i,:), qm(i,:), &
-            bm(i,:), latent_heat_vapor(i,:), latent_heat_sublim(i,:), latent_heat_fusion(i,:), qc_incld(i,:), qr_incld(i,:), &
-            qi_incld(i,:), qm_incld(i,:), nc_incld(i,:), nr_incld(i,:), ni_incld(i,:), &
-            bm_incld(i,:), mu_c(i,:), nu(i,:), lamc(i,:), cdist(i,:), cdist1(i,:), &
-            cdistr(i,:), mu_r(i,:), lamr(i,:), logn0r(i,:), qv2qi_depos_tend(i,:), precip_total_tend(i,:), &
-            nevapr(i,:), qr_evap_tend(i,:), vap_liq_exchange(i,:), vap_ice_exchange(i,:), &
-            liq_ice_exchange(i,:), pratot(i,:), prctot(i,:), frzimm(i,:), frzcnt(i,:), frzdep(i,:), p3_tend_out(i,:,:), p3_sc_tau_out(i,:,:), is_hydromet_present, &
-	         do_precip_off, nccnst, warm_rain_method)
+       if (trim(warm_rain_method) == 'ftorch_emulator_chunk_dp') then
+          chunk_col_start = (i - its) * (kte - kts + 1) + 1
+          chunk_col_end   = (i - its + 1) * (kte - kts + 1)
+          call p3_main_part2(kts, kte, kbot, ktop, kdir, do_predict_nc, do_prescribed_CCN, dt, inv_dt, &
+               p3_autocon_coeff,p3_accret_coeff,p3_qc_autocon_expon,p3_nc_autocon_expon,p3_qc_accret_expon, &
+               p3_wbf_coeff,p3_embryonic_rain_size, p3_max_mean_rain_size, &
+               pres(i,:), dpres(i,:), dz(i,:), nc_nuceat_tend(i,:), exner(i,:), inv_exner(i,:), &
+               inv_cld_frac_l(i,:), inv_cld_frac_i(i,:), inv_cld_frac_r(i,:), ni_activated(i,:), inv_qc_relvar(i,:), &
+               cld_frac_i(i,:), cld_frac_l(i,:), cld_frac_r(i,:), qv_prev(i,:), t_prev(i,:), &
+               t_atm(i,:), rho(i,:), inv_rho(i,:), qv_sat_l(i,:), &
+               qv_sat_i(i,:), qv_supersat_i(i,:), rhofacr(i,:), rhofaci(i,:), acn(i,:), qv(i,:), th_atm(i,:), &
+               qc(i,:), nc(i,:), qr(i,:), nr(i,:), qi(i,:), ni(i,:), qm(i,:), &
+               bm(i,:), latent_heat_vapor(i,:), latent_heat_sublim(i,:), latent_heat_fusion(i,:), qc_incld(i,:), qr_incld(i,:), &
+               qi_incld(i,:), qm_incld(i,:), nc_incld(i,:), nr_incld(i,:), ni_incld(i,:), &
+               bm_incld(i,:), mu_c(i,:), nu(i,:), lamc(i,:), cdist(i,:), cdist1(i,:), &
+               cdistr(i,:), mu_r(i,:), lamr(i,:), logn0r(i,:), qv2qi_depos_tend(i,:), precip_total_tend(i,:), &
+               nevapr(i,:), qr_evap_tend(i,:), vap_liq_exchange(i,:), vap_ice_exchange(i,:), &
+               liq_ice_exchange(i,:), pratot(i,:), prctot(i,:), frzimm(i,:), frzcnt(i,:), frzdep(i,:), p3_tend_out(i,:,:), p3_sc_tau_out(i,:,:), is_hydromet_present, &
+               do_precip_off, nccnst, warm_rain_method, &
+               ftorch_out_chunk_col=ftorch_out_chunk_dp(:, chunk_col_start:chunk_col_end))
+       else
+          call p3_main_part2(kts, kte, kbot, ktop, kdir, do_predict_nc, do_prescribed_CCN, dt, inv_dt, &
+               p3_autocon_coeff,p3_accret_coeff,p3_qc_autocon_expon,p3_nc_autocon_expon,p3_qc_accret_expon, &
+               p3_wbf_coeff,p3_embryonic_rain_size, p3_max_mean_rain_size, &
+               pres(i,:), dpres(i,:), dz(i,:), nc_nuceat_tend(i,:), exner(i,:), inv_exner(i,:), &
+               inv_cld_frac_l(i,:), inv_cld_frac_i(i,:), inv_cld_frac_r(i,:), ni_activated(i,:), inv_qc_relvar(i,:), &
+               cld_frac_i(i,:), cld_frac_l(i,:), cld_frac_r(i,:), qv_prev(i,:), t_prev(i,:), &
+               t_atm(i,:), rho(i,:), inv_rho(i,:), qv_sat_l(i,:), &
+               qv_sat_i(i,:), qv_supersat_i(i,:), rhofacr(i,:), rhofaci(i,:), acn(i,:), qv(i,:), th_atm(i,:), &
+               qc(i,:), nc(i,:), qr(i,:), nr(i,:), qi(i,:), ni(i,:), qm(i,:), &
+               bm(i,:), latent_heat_vapor(i,:), latent_heat_sublim(i,:), latent_heat_fusion(i,:), qc_incld(i,:), qr_incld(i,:), &
+               qi_incld(i,:), qm_incld(i,:), nc_incld(i,:), nr_incld(i,:), ni_incld(i,:), &
+               bm_incld(i,:), mu_c(i,:), nu(i,:), lamc(i,:), cdist(i,:), cdist1(i,:), &
+               cdistr(i,:), mu_r(i,:), lamr(i,:), logn0r(i,:), qv2qi_depos_tend(i,:), precip_total_tend(i,:), &
+               nevapr(i,:), qr_evap_tend(i,:), vap_liq_exchange(i,:), vap_ice_exchange(i,:), &
+               liq_ice_exchange(i,:), pratot(i,:), prctot(i,:), frzimm(i,:), frzcnt(i,:), frzdep(i,:), p3_tend_out(i,:,:), p3_sc_tau_out(i,:,:), is_hydromet_present, &
+               do_precip_off, nccnst, warm_rain_method)
+       endif
 
 
        ! measure microphysics processes tendency output
@@ -2329,6 +2721,7 @@ end function bfb_expm1
 
     else
 
+       mu_c   = 0._rtype
        lamc   = 0._rtype
        cdist  = 0._rtype
        cdist1 = 0._rtype

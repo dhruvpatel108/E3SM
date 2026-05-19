@@ -19,8 +19,8 @@ main() {
 readonly MACHINE=pm-cpu
 # BEFORE RUNNING:  CHANGE this to your project
 readonly PROJECT="m4942"
-readonly QUEUE="debug"  # 'regular', 'debug', 'premium'
-readonly COMPILER="gnu"
+readonly QUEUE="${QUEUE:-debug}"  # 'regular', 'debug', 'premium'
+readonly COMPILER="${COMPILER:-gnu}"
 
 # Simulation
 readonly COMPSET="F2010"
@@ -28,7 +28,7 @@ readonly COMPSET="F2010"
 readonly RESOLUTION="ne4pg2_oQU480" 
 #readonly RESOLUTION="ne30pg2_r05_IcoswISC30E3r5"
 # BEFORE RUNNING : CHANGE the following CASE_NAME to desired value
-readonly CASE_NAME="e3sm2025_mlmicro_dnn_emulator_withinputfilters5"
+readonly CASE_NAME="${CASE_NAME:-e3sm2025_mlmicro_ftorch_batch_smoke}"
 # If this is part of a simulation campaign, ask your group lead about using a case_group label
 # readonly CASE_GROUP=""
 
@@ -55,7 +55,7 @@ readonly CODE_ROOT="${HOME}/e3sm_ftorch"
 #readonly CODE_ROOT="/global/cfs/cdirs/m4549/code/e3sm2025_ftorch_mlmicro"  
 #readonly CODE_ROOT="/pscratch/sd/p/plma/shared/for_andrew/E3SM"
 #readonly CASE_ROOT="/pscratch/sd/a/agett/e3sm_scratch/${CASE_NAME}"
-readonly CASE_ROOT="/pscratch/sd/d/dvpatel/mlmicrophysics_project/e3sm_ftorch_scratch/${CASE_NAME}"
+readonly CASE_ROOT="${CASE_ROOT:-/pscratch/sd/d/dvpatel/mlmicrophysics_project/e3sm_ftorch_scratch/${CASE_NAME}}"
 rm -rf $CASE_ROOT
 
 # Sub-directories
@@ -66,7 +66,7 @@ readonly CASE_ARCHIVE_DIR=${CASE_ROOT}/archive
 #  short tests: 'XS_2x5_ndays', 'XS_1x10_ndays', 'S_1x10_ndays',
 #               'M_1x10_ndays', 'M2_1x10_ndays', 'M80_1x10_ndays', 'L_1x10_ndays'
 #  or 'production' for full simulation
-readonly run="XS_1x1_ndays"
+readonly run="${RUN_CONFIG:-XS_1x1_ndays}"
 #readonly run="production"
 
 if [ "${run}" != "production" ]; then
@@ -97,10 +97,10 @@ else
   readonly PELAYOUT="custom-43"
   readonly WALLTIME="06:00:00"
   readonly STOP_OPTION="nmonths"
-  readonly STOP_N="12"
+  readonly STOP_N="1"
   readonly REST_OPTION="nmonths"
-  readonly REST_N="12"
-  readonly RESUBMIT="1"
+  readonly REST_N="1"
+  readonly RESUBMIT="0"
   readonly DO_SHORT_TERM_ARCHIVING=false
 fi
 
@@ -109,14 +109,14 @@ readonly HIST_OPTION="nyears"
 readonly HIST_N="5"
 
 # Leave empty (unless you understand what it does)
-readonly OLD_EXECUTABLE=""
+readonly OLD_EXECUTABLE="${OLD_EXECUTABLE:-}"
 
 # --- Toggle flags for what to do ----
-do_fetch_code=false
-do_create_newcase=true
-do_case_setup=true
-do_case_build=true
-do_case_submit=true
+do_fetch_code=${DO_FETCH_CODE:-false}
+do_create_newcase=${DO_CREATE_NEWCASE:-true}
+do_case_setup=${DO_CASE_SETUP:-true}
+do_case_build=${DO_CASE_BUILD:-true}
+do_case_submit=${DO_CASE_SUBMIT:-true}
 
 # --- Now, do the work ---
 
@@ -165,9 +165,9 @@ user_nl() {
 
 cat << EOF >> user_nl_eam
 
- p3_warm_rain_method = 'ftorch_emulator'
+ p3_warm_rain_method = '${P3_WARM_RAIN_METHOD:-ftorch_emulator}'
 
- p3_torchscript_warm_rain_emulator_file = '/pscratch/sd/d/dvpatel/mlmicrophysics_project/trained_emulator_files/emulator107666_torchscript_qctauin1e-6_cloud1e-2.pt'
+ p3_torchscript_warm_rain_emulator_file = '${P3_TORCHSCRIPT_WARM_RAIN_EMULATOR_FILE:-/pscratch/sd/d/dvpatel/mlmicrophysics_project/trained_emulator_files/emulator643721_endoftraining_batch.pt}'
  p3_tau_kernel_file = '/global/cfs/cdirs/m4942/e3sm/emulators/old_emulator_files/KBARF_tau_kernel.dat' 
  p3_stochastic_emulated_filename_quantile = '/global/cfs/cdirs/m4942/e3sm/emulators/old_emulator_files/quantile_neural_net_fortran.nc'
  p3_stochastic_emulated_filename_input_scale = '/global/cfs/cdirs/m4942/e3sm/emulators/old_emulator_files/input_quantile_scaler.nc'

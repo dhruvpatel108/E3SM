@@ -174,9 +174,9 @@
       <arguments>
         <arg name="label"> --label</arg>
         <arg name="num_tasks"> -n {{ total_tasks }} -N {{ num_nodes }}</arg>
-        <arg name="thread_count">-c $SHELL{echo 256/`./xmlquery --value MAX_MPITASKS_PER_NODE`|bc}</arg>
-        <arg name="binding"> $SHELL{if [ 128 -ge `./xmlquery --value MAX_MPITASKS_PER_NODE` ]; then echo "--cpu_bind=cores"; else echo "--cpu_bind=threads";fi;} </arg>
-        <arg name="placement"> -m plane=$SHELL{echo `./xmlquery --value MAX_MPITASKS_PER_NODE`}</arg>
+        <arg name="thread_count">-c $SHELL{max_mpi_tasks_per_node=$(./xmlquery --value MAX_MPITASKS_PER_NODE | sed -n '$p'); echo 256/$max_mpi_tasks_per_node|bc}</arg>
+        <arg name="binding"> $SHELL{max_mpi_tasks_per_node=$(./xmlquery --value MAX_MPITASKS_PER_NODE | sed -n '$p'); if [ 128 -ge $max_mpi_tasks_per_node ]; then echo "--cpu_bind=cores"; else echo "--cpu_bind=threads";fi;} </arg>
+        <arg name="placement"> -m plane=$SHELL{./xmlquery --value MAX_MPITASKS_PER_NODE | sed -n '$p'}</arg>
     </arguments>
     </mpirun>
     <module_system type="module" allow_error="true">
@@ -323,7 +323,7 @@
     <environment_variables compiler="gnu">
       <env name="MOAB_ROOT">$SHELL{if [ -z "$MOAB_ROOT" ]; then echo /global/cfs/cdirs/e3sm/software/moab/gnu; else echo "$MOAB_ROOT"; fi}</env>
       <env name="FTorch_ROOT">$SHELL{if [ -z "$FTorch_ROOT" ]; then echo /global/cfs/cdirs/m4549/code/FTorch_gnu_cpu; else echo "$FTorch_ROOT"; fi}</env>
-      <env name="LD_LIBRARY_PATH">/global/cfs/cdirs/e3sm/software/libtorch/libtorch-cxx11-abi-shared-with-deps-2.6.0+cpu/lib:$ENV{LD_LIBRARY_PATH}</env>
+      <env name="LD_LIBRARY_PATH">/global/common/software/nersc9/pytorch/2.6.0/lib/python3.12/site-packages/torch/lib:/global/common/software/nersc9/pytorch/2.6.0/lib:/global/common/software/nersc9/nccl/2.24.3/plugin/lib:/global/common/software/nersc9/nccl/2.24.3/lib:/global/common/software/nersc9/cudnn/9.5.0-cuda12/lib:/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda/12.4/extras/CUPTI/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/math_libs/12.4/lib64:/opt/nvidia/hpc_sdk/Linux_x86_64/24.5/cuda/12.4/lib64:/opt/cray/libfabric/1.22.0/lib64:$ENV{LD_LIBRARY_PATH}</env>
       <env name="MPICH_GPU_SUPPORT_ENABLED">0</env>
     </environment_variables>
     <resource_limits>
